@@ -1,4 +1,8 @@
 import os
+from collections import OrderedDict
+
+import onnx
+import onnxsim
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +37,8 @@ def get_argparser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--checkpoint", default="LOG/ResNet8_E500_A99.99302455.pt", type=str)
+    parser.add_argument("--onnx", default=True, type=bool)
+    parser.add_argument("--onnxsim", default=True, type=bool)
 
     parser.add_argument("--epoch", type=int, default=100)
     parser.add_argument("--resize", type=int, default=50)
@@ -72,7 +78,8 @@ def main():
                 std=[0.229, 0.224, 0.225]),
         ])
     )
-    train_dataloader = DataLoader(train_dataset, batch_size=opt.train_batch_size, pin_memory=True, shuffle=True, num_workers=opt.workers)
+    train_dataloader = DataLoader(train_dataset, batch_size=opt.train_batch_size, pin_memory=True, shuffle=True,
+                                  num_workers=opt.workers)
     val_dataset = D.ImageFolder(
         os.path.join(opt.dataset, 'val'),
         T.Compose([
@@ -83,7 +90,8 @@ def main():
                 std=[0.229, 0.224, 0.225]),
         ])
     )
-    val_dataloader = DataLoader(val_dataset, batch_size=opt.val_batch_size,  pin_memory=True, shuffle=True, num_workers=opt.workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=opt.val_batch_size, pin_memory=True, shuffle=True,
+                                num_workers=opt.workers)
 
     logger.info(f"Train Batchsize:{opt.train_batch_size} Validation Batchsize:{opt.val_batch_size}.")
     logger.info(f"Dataset Loaded.")
@@ -97,7 +105,7 @@ def main():
     # modeltype = 'MobileNetV2'
     # model = MobileNetV3(num_classes=len(train_dataset.classes))
     # modeltype = 'MobileNetV3'
-    model = ResNet(depth=8, num_classes=len(train_dataset.classes))
+    model = pytorchmodel = ResNet(depth=8, num_classes=len(train_dataset.classes))
     modeltype = 'ResNet8'
     # model = ResNet(depth=56, num_classes=len(train_dataset.classes))
     # modeltype = 'ResNet56'
@@ -173,6 +181,7 @@ def main():
         total_train_loss = 0
         total_train_accuracy = 0
 
+        # Validation
         if c_epoch % opt.val_interval == 0:
             logger.info(f'Epoch:{c_epoch} Start Validation...')
             val_total_loss = 0
@@ -192,10 +201,41 @@ def main():
             val_meanaccuracy = val_total_accuracy / (val_iteration + 1)
             logger.info(f'Epoch:{c_epoch} ValidationLoss:{val_meanloss:.05f} ValidationAccuray:{val_meanaccuracy:.08f}')
 
+        # save pt&onnx
         if c_epoch % opt.save_interval == 0:
-            ptname = f'{modeltype}_E{c_epoch}_A{(val_meanaccuracy*100):.08f}.pt'
+            ptname = f'{modeltype}_E{c_epoch}_A{(val_meanaccuracy * 100):.08f}.pt'
             torch.save(model.state_dict(), f'LOG/{ptname}')
             logger.info(f'Epoch:{c_epoch} Model save as \'LOG/{ptname}\'')
+            if opt.onnx:
+                onnxpath = ptname[:-3] + '.onnx'
+                onnxsimpath = ptname[:-3] + '_sim.onnx'
+                im = torch.rand((1, 3, opt.resize, opt.resize))
+                onnxmodel = pytorchmodel
+                checkpoint = torch.load(ptname)
+                new_checkpoint = OrderedDict()
+                for k, v in checkpoint.items():
+                    name = k[7:]
+                    new_checkpoint[name] = v
+                onnxmodel.load_state_dict(new_checkpoint)
+                logger.info(f"Model restored from {opt.checkpoint}")
+                del checkpoint
+
+                torch.onnx.export(onnxmodel, im, onnxpath, verbose=False, opset_version=13,
+                                  training=torch.onnx.TrainingMode.EVAL,
+                                  do_constant_folding=True,
+                                  input_names=['image'],
+                                  output_names=['output'])
+                logger.info(f'Epoch:{c_epoch} Onnx model save as \'{onnxpath}\'.')
+                if opt.onnxsim:
+                    model_onnx = onnx.load(onnxpath)
+                    onnx.checker.check_model(model_onnx)
+                    model_onnx, check = onnxsim.simplify(model_onnx)
+                    if not check:
+                        logger.info('onnx check failed')
+                    else:
+                        onnx.save(model_onnx, onnxsimpath)
+                        logger.info(f'Epoch:{c_epoch} Simplified onnx model save as \'{onnxsimpath}\'.')
+
 
         if c_epoch == opt.epoch:
             break
